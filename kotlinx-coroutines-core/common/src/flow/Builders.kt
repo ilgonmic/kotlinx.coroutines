@@ -11,9 +11,9 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.*
 import kotlinx.coroutines.channels.Channel.Factory.BUFFERED
 import kotlinx.coroutines.flow.internal.*
-import kotlinx.coroutines.flow.internal.unsafeFlow as flow
 import kotlin.coroutines.*
 import kotlin.jvm.*
+import kotlinx.coroutines.flow.internal.unsafeFlow as flow
 
 /**
  * Creates a flow from the given suspendable [block].
@@ -259,10 +259,14 @@ public fun <T> channelFlow(@BuilderInference block: suspend ProducerScope<T>.() 
  *
  * This builder ensures thread-safety and context preservation, thus the provided [ProducerScope] can be used
  * from any context, e.g. from a callback-based API.
- * The resulting flow completes as soon as the code in the [block] and all its children completes.
- * Use [awaitClose] as the last statement to keep it running.
- * The [awaitClose] argument is called either when a flow consumer cancels the flow collection
- * or when a callback-based API invokes [SendChannel.close] manually.
+ * The resulting flow completes as soon as the code in the [block] completes.
+ * [awaitClose] should be used to keep the flow running, otherwise the channel will be closed immediately
+ * when block completes.
+ * [awaitClose] argument is called either when a flow consumer cancels the flow collection
+ * or when a callback-based API invokes [SendChannel.close] manually and is typically used
+ * to cleanup the resources after the completion, e.g. unregister a callback.
+ * Using [awaitClose] is mandatory in order to prevent memory leaks when the flow collection is cancelled,
+ * otherwise the callback may keep running even when the flow collector is already completed.
  *
  * A channel with the [default][Channel.BUFFERED] buffer size is used. Use the [buffer] operator on the
  * resulting flow to specify a user-defined value and to control what happens when data is produced faster
@@ -287,21 +291,20 @@ public fun <T> channelFlow(@BuilderInference block: suspend ProducerScope<T>.() 
  *         override fun onCompleted() = channel.close()
  *     }
  *     api.register(callback)
- *     // Suspend until either onCompleted or external cancellation are invoked
+ *     /*
+ *      * Suspends until either 'onCompleted' from the callback is invoked
+ *      * or flow collector is cancelled (e.g. by 'take(1)' or because a collector's activity was destroyed).
+ *      * In both cases, callback will be properly unregistered.
+ *      */
  *     awaitClose { api.unregister(callback) }
  * }
  * ```
- *
- * This function is an alias for [channelFlow], it has a separate name to reflect
- * the intent of the usage (integration with a callback-based API) better.
  */
-@Suppress("NOTHING_TO_INLINE")
 @ExperimentalCoroutinesApi
-public inline fun <T> callbackFlow(@BuilderInference noinline block: suspend ProducerScope<T>.() -> Unit): Flow<T> =
-    channelFlow(block)
+public fun <T> callbackFlow(@BuilderInference block: suspend ProducerScope<T>.() -> Unit): Flow<T> = CallbackFlowBuilder(block)
 
 // ChannelFlow implementation that is the first in the chain of flow operations and introduces (builds) a flow
-private class ChannelFlowBuilder<T>(
+private open class ChannelFlowBuilder<T>(
     private val block: suspend ProducerScope<T>.() -> Unit,
     context: CoroutineContext = EmptyCoroutineContext,
     capacity: Int = BUFFERED
@@ -314,4 +317,37 @@ private class ChannelFlowBuilder<T>(
 
     override fun toString(): String =
         "block[$block] -> ${super.toString()}"
+}
+
+private class CallbackFlowBuilder<T>(
+    private val block: suspend ProducerScope<T>.() -> Unit,
+    context: CoroutineContext = EmptyCoroutineContext,
+    capacity: Int = BUFFERED
+) : ChannelFlowBuilder<T>(block, context, capacity) {
+
+    private val collectCallback: suspend (ProducerScope<T>) -> Unit = {
+        collectTo(it)
+        /*
+         * We expect user either call `awaitClose` from within a block (then the channel is closed at this moment)
+         * or being closed/cancelled externally/manually. Otherwise "user forgot to call
+         * awaitClose and receives unhelpful ClosedSendChannelException exceptions" situation is detected.
+         */
+        if (it.isActive && !it.isClosedForSend) {
+            throw IllegalStateException(
+                """
+                    'awaitClose { yourCallbackOrListener.cancel() }' should be used in the end of callbackFlow block.
+                    Otherwise, a callback/listener may leak in case of cancellation external cancellation (e.g. by 'take(1)' or destroyed activity).
+                    For a more detailed explanation, please refer to callbackFlow KDoc. 
+            """.trimIndent())
+        }
+    }
+
+    override fun broadcastImpl(scope: CoroutineScope, start: CoroutineStart): BroadcastChannel<T> =
+        scope.broadcast(context, produceCapacity, start, block = collectCallback)
+
+    override fun produceImpl(scope: CoroutineScope): ReceiveChannel<T> =
+        scope.produce(context, produceCapacity, block = collectCallback)
+
+    override fun create(context: CoroutineContext, capacity: Int): ChannelFlow<T> =
+        CallbackFlowBuilder(block, context, capacity)
 }
